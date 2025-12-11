@@ -1,0 +1,9 @@
+python .\DML.py `                                                                                                                                                           
+   --data-dir "observationer/aar_parquet" `                                                                                                                                                                         
+   --pattern "observationer_year=*.parquet" `
+   --workers 20 `
+   --species "Tornsanger" `
+   --start-year 1980 --end-year 2000 `
+   --heterogeneous `
+   --output "output/tornsanger/tornsanger_1990_2024.csv" `
+   --mode save_preprocessed --preprocessed-path output/processed_data.parquet
