@@ -7,3 +7,14 @@ python .\DML.py `
    --heterogeneous `
    --output "output/tornsanger/tornsanger_1990_2024.csv" `
    --mode save_preprocessed --preprocessed-path output/processed_data.parquet
+
+python .\DML_1.1.py `
+   --data-dir "observationer/aar_parquet" `
+   --pattern "observationer_year=*.parquet" `
+   --workers 20 `
+   --species "Sølvhejre" `
+   --start-year 1990 --end-year 2024 `
+   --hetero-method causalforest `
+   --heterogeneous `
+   --output "output/sølvhejre/sølvhejre_1990_2024.csv" `
+   --report-pdf "output/sølvhejre/sølvhejre_1990_2024.pdf"

@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -74,7 +73,7 @@ def parse_args():
     ap.add_argument("--report-pdf", type=str, default="trend_rapport.pdf", help="PDF-rapport.")
     ap.add_argument("--mode", type=str, choices=["normal", "save_preprocessed", "use_preprocessed"], default="normal",
                     help="Kørselstilstand: normal, save_preprocessed, use_preprocessed.")
-    ap.add_argument("--preprocessed-path", type=str, default="output/processed_data.parquet",
+    ap.add_argument("--preprocessed-path", type=str, default="preprocessed/processed_data.parquet",
                     help="Sti til preprocessed data (bruges af save/use).")
     ap.add_argument("--no-crossfit", action="store_true", help="Deaktiver cross-fitting (OOF) for m(X) og s(X).")
     ap.add_argument("--hetero-method", type=str, choices=["rlearner", "causalforest"], default="rlearner",
@@ -220,6 +219,13 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["detected"] = (df["Antal"] > 0).astype(int)
     df["log_count"] = np.log1p(df["Antal"])
 
+    # --- NYT: Uge-basis pr. grid ---
+    df["week"] = df["Dato_dt"].dt.isocalendar().week
+    df["year"] = df["Dato_dt"].dt.year  # sikrer år matcher uge
+    # Du kan nu gruppere sådan:
+    # weekly_grid_df = df.groupby(["grid_id", "year", "week"])["Antal"].sum().reset_index()
+    # weekly_grid_df.to_csv("output/weekly_sum_per_grid.csv", index=False)
+
     return df
 
 def engineer_features_parallel(df: pd.DataFrame, workers: int = 4) -> pd.DataFrame:
@@ -319,23 +325,56 @@ def oof_predict_classifier_proba(model_ctor, X, y, n_splits: int = 5):
 
 # Optional: causal forest tau(W) via econml (fallback til R-learner hvis ikke tilg.),
 # bruges kun hvis hetero_method == 'causalforest'.
-def causal_forest_tau_w(Y, T, X_controls, W):
-    try:
-        from econml.dml import CausalForestDML
-        # Bemærk: her antager vi continuous treatment; hvis pakken ikke understøtter det,
-        # vil et ImportError/TypeError opstå og vi falder tilbage.
-        est = CausalForestDML(
-            model_y=RandomForestRegressor(n_estimators=400, min_samples_leaf=5, random_state=42),
-            model_t=RandomForestRegressor(n_estimators=400, min_samples_leaf=5, random_state=42),
-            cv=None,
-            random_state=42
+
+def causal_forest_tau_x(
+    Y, T, X_controls, W,
+    *,
+    treatment_is_binary=False,
+    n_estimators=400,
+    min_samples_leaf=5,
+    cv=3,
+    random_state=42
+):
+    """
+    Returnerer CATE τ(X_controls) fra CausalForestDML.
+    - Y: outcome (shape: (n,))
+    - T: treatment (shape: (n,))
+    - X_controls: heterogenitets-features (shape: (n, p_x)) -> τ(X_controls)
+    - W: konfoundere/controls (shape: (n, p_w))
+    """
+    import numpy as np
+    from econml.dml import CausalForestDML
+    from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+    if treatment_is_binary:
+        model_t = RandomForestClassifier(
+            n_estimators=n_estimators, min_samples_leaf=min_samples_leaf, random_state=random_state
         )
-        est.fit(Y, T, X=X_controls, W=W)
-        tau_w = est.effect(X=X_controls, W=W)
-        return np.asarray(tau_w)
-    except Exception as e:
-        print("CausalForestDML ikke tilgængelig eller understøtter ikke behandlingstypen; falder tilbage til R-learner.")
-        return None
+        discrete_treatment = True
+    else:
+        model_t = RandomForestRegressor(
+            n_estimators=n_estimators, min_samples_leaf=min_samples_leaf, random_state=random_state
+        )
+        discrete_treatment = False
+    model_y = RandomForestRegressor(
+        n_estimators=n_estimators, min_samples_leaf=min_samples_leaf, random_state=random_state
+    )
+    est = CausalForestDML(
+        model_y=model_y,
+        model_t=model_t,
+        discrete_treatment=discrete_treatment,
+        cv=cv,                 # cross-fitting er typisk en god idé
+        random_state=random_state
+    )
+    est.fit(Y, T, X=X_controls, W=W)
+    # CATE som funktion af X_controls
+    tau_x = est.effect(X=X_controls)
+    # Valgfrit: konfidensinterval
+    try:
+        lb, ub = est.effect_interval(X=X_controls)
+    except RuntimeWarning:
+        lb = ub = np.full_like(tau_x, np.nan)
+    return np.asarray(tau_x), (np.asarray(lb), np.asarray(ub)), est
+
 
 def fit_propensity_score(X: pd.DataFrame, T: np.ndarray) -> np.ndarray:
     model = HistGradientBoostingRegressor(max_depth=6, learning_rate=0.05, max_iter=300)
@@ -370,52 +409,6 @@ def rlearner_tau_w(Y: np.ndarray, T: np.ndarray, mX: np.ndarray, sX: np.ndarray,
     rf.fit(W_keep, R, sample_weight=(Z[keep] ** 2))
     tau_w = rf.predict(W)
     return tau_w
-
-
-def _year_design(df: pd.DataFrame, X: pd.DataFrame):
-    """Byg en one-hot designmatrix for år og residualiser årsdummies mod X."""
-    years = np.sort(df["year"].astype(int).unique())
-    y0 = int(years.min())
-    year_labels = df["year"].astype(int).values
-    # One-hot D (n_obs x n_years)
-    Ymap = {y:i for i,y in enumerate(years)}
-    D = np.zeros((len(df), len(years)), dtype=float)
-    for i, y in enumerate(year_labels):
-        D[i, Ymap[y]] = 1.0
-    # P(year|X) via histGB classifier
-    clf_year = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.05, max_iter=300)
-    clf_year.fit(X, year_labels)
-    # Align predict_proba columns to 'years' order
-    proba = clf_year.predict_proba(X)
-    # sklearn kan returnere klasser i sorteret rækkefølge -> match:
-    cls_order = clf_year.classes_
-    P = np.zeros_like(D)
-    for j, y in enumerate(years):
-        cj = np.where(cls_order == y)[0][0]
-        P[:, j] = proba[:, cj]
-    D_res = D - P
-    return years, y0, D_res
-
-def _ridge_year_effects(y_res: np.ndarray, D_res: np.ndarray, lambda_diff: float = 5.0):
-    """Ridge-penaliseret estimation af års-koefficienter med glathed via første-difference."""
-    n_years = D_res.shape[1]
-    # Penalty: ||Δβ||^2, hvor Δ er (n_years-1) x n_years difference-matrix
-    Delta = np.zeros((n_years-1, n_years))
-    for r in range(n_years-1):
-        Delta[r, r] = -1.0
-        Delta[r, r+1] = 1.0
-    # Normal equations: (D' D + λ Δ'Δ) β = D' y
-    XtX = D_res.T @ D_res
-    Pen = Delta.T @ Delta
-    A = XtX + lambda_diff * Pen
-    b = D_res.T @ y_res
-    # Identifiabilitet: sæt basisåret (kolonne 0) til 0 via "ref" - fjern kol., løs og indsæt 0
-    A_sub = A[1:, 1:]
-    b_sub = b[1:]
-    beta_sub = np.linalg.solve(A_sub, b_sub)
-    beta = np.zeros(n_years)
-    beta[1:] = beta_sub
-    return beta  # log-skala offsets pr. år (baseline år = 0)
 
 
 # ---------------------------
@@ -465,8 +458,7 @@ def estimate_trend_components(df: pd.DataFrame, heterogeneous: bool = False, ens
     tau_samples = []   # <- NEW: saml log-trends fra hver resample
     n = len(df)
     for b in range(ensemble_B):
-        if (b+1) % 10 == 0 or b == 0 or b == ensemble_B-1:
-            print(f"  Bootstrap {b+1}/{ensemble_B} ...")
+        print(f"    Bootstrap {b+1}/{ensemble_B} ...")
         idx = rng.integers(low=0, high=n, size=n)
         df_b = df.iloc[idx]
 
@@ -519,13 +511,12 @@ def estimate_trend_components(df: pd.DataFrame, heterogeneous: bool = False, ens
         df_tmp = df[["grid_id", "x_c", "y_c"]].copy()
         if tau_det_w is not None:
             df_tmp["tau_det_w"] = tau_det_w
-        if (df_pos is not None) and (len(df_pos) > 0) and ("tau_cnt_w" in locals()) and (tau_cnt_w is not None):
+        if (df_pos is not None) and (len(df_pos) > 0) and (tau_cnt_w is not None):
             df_cnt_tmp = df_pos[["grid_id"]].copy()
             df_cnt_tmp["tau_cnt_w"] = tau_cnt_w
             g_cnt = df_cnt_tmp.groupby("grid_id", as_index=False)["tau_cnt_w"].mean()
         else:
             g_cnt = pd.DataFrame(columns=["grid_id", "tau_cnt_w"])
-
         g_det = df_tmp.groupby("grid_id", as_index=False).agg(
             x_c=("x_c", "median"), y_c=("y_c", "median"),
             tau_det_w=("tau_det_w", "mean")
@@ -535,75 +526,6 @@ def estimate_trend_components(df: pd.DataFrame, heterogeneous: bool = False, ens
         out["tau_grid_table"] = g
         print(f"Rumlig trend-tabel færdig: {len(g)} grids")
     return out
-
-
-def estimate_yearwise_components(df: pd.DataFrame, lambda_diff: float = 5.0):
-    """
-    Estimer års-specifikke effekter (ikke-monotont indeks) for både forekomst og count|forekomst.
-    Returnerer DataFrame med year, beta_det, beta_cnt, beta_abund, index_raw (baseline=100).
-    """
-    # Fælles feature-matrix
-    X_det, _ = build_feature_matrix(df)
-    # Forekomst
-    Y_det = df["detected"].values.astype(float)
-    # Residualiser outcome (mX) og årsdummies (D_res)
-    clf = RandomForestClassifier(n_estimators=600, min_samples_leaf=5, n_jobs=-1, random_state=42)
-    clf.fit(X_det, df["detected"].values.astype(int))
-    proba = clf.predict_proba(X_det)
-    if proba.shape[1] == 1:
-        mX_det = np.full(len(X_det), proba[0, 0])
-    else:
-        mX_det = proba[:, 1]
-    y_res_det = Y_det - mX_det
-    years, y0, D_res_det = _year_design(df, X_det)
-
-    beta_det = _ridge_year_effects(y_res_det, D_res_det, lambda_diff=lambda_diff)
-
-    # Count|forekomst
-    df_pos = df[df["detected"] == 1]
-    if len(df_pos) < 100:
-        beta_cnt = np.zeros_like(beta_det)
-    else:
-        X_cnt, _ = build_feature_matrix(df_pos)
-        Y_cnt = df_pos["log_count"].values.astype(float)
-        mX_cnt = fit_conditional_mean_reg(X_cnt, Y_cnt)  # RF
-        y_res_cnt = Y_cnt - mX_cnt
-        # Align D_res til df_pos (samme år-rækkefølge)
-        years_cnt = df_pos["year"].astype(int).values
-        Ymap = {y:i for i,y in enumerate(years)}
-        D_res_cnt = np.zeros((len(df_pos), len(years)), dtype=float)
-        # recompute P(year|X) for df_pos via år-klf på X_cnt:
-        clf_year_cnt = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.05, max_iter=300)
-        clf_year_cnt.fit(X_cnt, df_pos["year"].astype(int).values)
-        proba_cnt = clf_year_cnt.predict_proba(X_cnt)
-        cls_order_cnt = clf_year_cnt.classes_
-        for i, y in enumerate(years_cnt):
-            j = Ymap[y]
-            # hent rette kolonne for år y i proba_cnt:
-            cj = np.where(cls_order_cnt == y)[0][0]
-            D_res_cnt[i, j] = 1.0 - proba_cnt[i, cj]
-            # (for andre år, residualet er -p_j; det svarer til de 0'er i one-hot minus p_j)
-            for k, yk in enumerate(years):
-                if yk != y:
-                    ck = np.where(cls_order_cnt == yk)[0]
-                    if len(ck) == 1:
-                        D_res_cnt[i, k] = -proba_cnt[i, ck[0]]
-                    else:
-                        D_res_cnt[i, k] += 0.0  # hvis yk ikke forekommer i klasserne
-        beta_cnt = _ridge_year_effects(y_res_cnt, D_res_cnt, lambda_diff=lambda_diff)
-
-    beta_abund = beta_det + beta_cnt  # log-skala
-    index = 100.0 * np.exp(beta_abund)  # baseline år (første i 'years') = 100
-
-    out = pd.DataFrame({
-        "year": years,
-        "beta_det": beta_det,
-        "beta_cnt": beta_cnt,
-        "beta_abund": beta_abund,
-        "index_raw": index
-    })
-    return out, y0
-
 
 # ---------------------------
 # Artsspecifik simulering + RC-kalibrering
@@ -680,7 +602,6 @@ def simulate_species_datasets(df: pd.DataFrame, reps_per_scenario: int = 5) -> L
         print(f"Scenario {i+1}/{len(scenarios)}: {name} (mag={mag}, type={sc})")
         tau_g = assign_spatial_trend(ggrid, sc, mag)
         for r in range(reps_per_scenario):
-            print(f"  Rep {r+1}/{reps_per_scenario} for scenario '{name}'")
             # Stratificeret resampling pr år
             parts = []
             for yr in years:
@@ -749,60 +670,6 @@ def residual_confounding_via_simulation(df: pd.DataFrame, reps_per_scenario: int
     lr.fit(sim_df[["tau_hat"]], sim_df["tau_true"])
     beta0 = float(lr.intercept_); beta1 = float(lr.coef_[0])
     return beta0, beta1, sim_df
-
-
-def bootstrap_yearwise(df: pd.DataFrame,
-                       beta0: float,
-                       beta1: float,
-                       B: int = 100,
-                       lambda_diff: float = 5.0,
-                       random_state: int = 123):
-    """
-    Stratificeret bootstrap pr. år for at få 80% CI på slope-RC årskurven.
-    - Resampler med tilbagelægning inden for hvert år (samme antal som originalen).
-    - Genestimerer årseffekter via estimate_yearwise_components(...).
-    - RC-kalibrerer årlige slopes (Δβ_y), sætter første år til 0, akkumulerer og
-      konverterer til indeks (baseline=100).
-    Returnerer: years, lo80, hi80 (arrays i samme orden).
-    """
-    rng = np.random.default_rng(random_state)
-    years = np.sort(df["year"].astype(int).unique())
-    n_years = len(years)
-    year_to_rows = {y: np.where(df["year"].astype(int).values == y)[0] for y in years}
-
-    # Saml bootstrap-indeks pr. replikat (B x n_years)
-    idx_mat = np.zeros((B, n_years), dtype=float)
-
-    for b in range(B):
-        parts = []
-        for y in years:
-            rows = year_to_rows[y]
-            # robusthed: hvis et år har meget få observationer, resamplér stadig med samme størrelse
-            sel = rng.integers(low=0, high=len(rows), size=len(rows))
-            parts.append(df.iloc[rows[sel]])
-        df_b = pd.concat(parts, ignore_index=True)
-
-        # Årseffekter på bootstrap-sample
-        ydf_b, _ = estimate_yearwise_components(df_b, lambda_diff=lambda_diff)
-        ydf_b = ydf_b.sort_values("year").reset_index(drop=True)
-
-        # RC på slopes (Δβ_y)
-        tau_b = ydf_b["beta_abund"].diff().fillna(0.0).values          # Δβ_y
-        tau_b_rc = beta0 + beta1 * tau_b
-        if len(tau_b_rc) > 0:
-            tau_b_rc[0] = 0.0                                          # baseline år = 0
-        beta_b = np.cumsum(tau_b_rc)
-        idx_b = 100.0 * np.exp(beta_b)                                 # baseline=100
-
-        # ydf_b["year"] bør matche 'years' pga. stratificeret resampling
-        # ellers kunne vi mappe – men her er det samme orden:
-        idx_mat[b, :] = idx_b
-        print(f"  Bootstrap {b+1}/{B} færdig")
-
-    lo80 = np.percentile(idx_mat, 10, axis=0)
-    hi80 = np.percentile(idx_mat, 90, axis=0)
-    return years, lo80, hi80
-
 
 # ---------------------------
 # Plots & PDF-rapport
@@ -962,37 +829,60 @@ def make_pdf_report(pdf_path: str, meta: Dict[str, str], res: Dict[str, float],
 
 # --- Cross-fit version of estimate_trend_components ---
 def estimate_trend_components_crossfit(df: pd.DataFrame, heterogeneous: bool = False, ensemble_B: int = 100, hetero_method: str = "rlearner") -> Dict[str, float]:
-    # Detection component
+    print("  Bygger feature-matrix og residualiserer forekomst...")
     X_det, W_det = build_feature_matrix(df)
     Y_det = df["detected"].values.astype(float)
     T_det = df["year"].values.astype(float)
-    # OOF propensity s(X) and OOF m(X)
+    print("  OOF-prediction for propensity score (s(X))...")
     sX_det = oof_predict_regressor(lambda: HistGradientBoostingRegressor(max_depth=6, learning_rate=0.05, max_iter=300), X_det, T_det)
+    print("  OOF-prediction for m(X) (RandomForest)...")
     mX_det = oof_predict_classifier_proba(lambda: RandomForestClassifier(n_estimators=600, min_samples_leaf=5, n_jobs=-1, random_state=42), X_det, df["detected"].values)
+    print("  Estimerer global forekomst-trend (tau_det_global)...")
     tau_det_global, r2_det = dml_global_tau(Y_det, T_det, mX_det, sX_det)
     tau_det_w = None
     if heterogeneous:
+        print(f"  Estimerer rumlig forekomst-trend ({hetero_method})...")
         if hetero_method == 'causalforest':
-            tau_det_w = causal_forest_tau_w(Y_det, T_det, X_det, W_det)
+            tau_det_w, _, _ = causal_forest_tau_x(
+                Y_det, T_det, X_controls=X_det, W=W_det,
+                treatment_is_binary=False,
+                n_estimators=400,
+                min_samples_leaf=5,
+                cv=3,
+                random_state=42
+            )
         if tau_det_w is None:
             tau_det_w = rlearner_tau_w(Y_det, T_det, mX_det, sX_det, W_det)
-    # Count given detection
+    print("  Bygger feature-matrix for count|forekomst...")
     df_pos = df[df["detected"] == 1]
     if len(df_pos) < 100:
         tau_cnt_global, r2_cnt, tau_cnt_w = 0.0, np.nan, None
+        print("  For få positive til count-trend, sætter til 0")
     else:
         X_cnt, W_cnt = build_feature_matrix(df_pos)
         Y_cnt = df_pos["log_count"].values.astype(float)
         T_cnt = df_pos["year"].values.astype(float)
+        print("  OOF-prediction for propensity score (s(X)) på count...")
         sX_cnt = oof_predict_regressor(lambda: HistGradientBoostingRegressor(max_depth=6, learning_rate=0.05, max_iter=300), X_cnt, T_cnt)
+        print("  OOF-prediction for m(X) (RandomForest) på count...")
         mX_cnt = oof_predict_regressor(lambda: RandomForestRegressor(n_estimators=500, min_samples_leaf=5, n_jobs=-1, random_state=42), X_cnt, Y_cnt)
+        print("  Estimerer global count-trend (tau_cnt_global)...")
         tau_cnt_global, r2_cnt = dml_global_tau(Y_cnt, T_cnt, mX_cnt, sX_cnt)
         tau_cnt_w = None
         if heterogeneous:
+            print(f"  Estimerer rumlig count-trend ({hetero_method})...")
             if hetero_method == 'causalforest':
-                tau_cnt_w = causal_forest_tau_w(Y_cnt, T_cnt, X_cnt, W_cnt)
+                tau_cnt_w, _, _ = causal_forest_tau_x(
+                    Y_cnt, T_cnt, X_controls=X_cnt, W=W_cnt,
+                    treatment_is_binary=False,
+                    n_estimators=400,
+                    min_samples_leaf=5,
+                    cv=3,
+                    random_state=42
+                )
             if tau_cnt_w is None:
                 tau_cnt_w = rlearner_tau_w(Y_cnt, T_cnt, mX_cnt, sX_cnt, W_cnt)
+    print("  Samler global abundance-trend og starter bootstrap...")
     tau_abund_log = tau_det_global + tau_cnt_global
     ppy_abund = 100.0 * (np.exp(tau_abund_log) - 1.0)
     ppy_det = 100.0 * (np.exp(tau_det_global) - 1.0)
@@ -1003,8 +893,7 @@ def estimate_trend_components_crossfit(df: pd.DataFrame, heterogeneous: bool = F
     tau_samples = []
     n = len(df)
     for b in range(ensemble_B):
-        if (b+1) % 10 == 0 or b == 0 or b == ensemble_B-1:
-            print(f" Bootstrap {b+1}/{ensemble_B} ...")
+        print(f"    Bootstrap {b+1}/{ensemble_B} ...")
         idx = rng.integers(low=0, high=n, size=n)
         df_b = df.iloc[idx]
         Xd, _ = build_feature_matrix(df_b)
@@ -1055,6 +944,8 @@ def estimate_trend_components_crossfit(df: pd.DataFrame, heterogeneous: bool = F
             tau_det_w=("tau_det_w", "mean")
         )
         g = g_det.merge(g_cnt, on="grid_id", how="left")
+        g["tau_det_w"] = pd.to_numeric(g["tau_det_w"], errors="coerce")
+        g["tau_cnt_w"] = pd.to_numeric(g["tau_cnt_w"], errors="coerce")
         g["tau_abund_w"] = g["tau_det_w"].fillna(0.0) + g["tau_cnt_w"].fillna(0.0)
         out["tau_grid_table"] = g
         print(f"Rumlig trend-tabel færdig: {len(g)} grids")
@@ -1064,10 +955,6 @@ def main():
     args = parse_args()
     crossfit = not args.no_crossfit
 
-    output_dir = os.path.dirname(args.output)
-    figs_dir = os.path.join(output_dir, "figs")
-    os.makedirs(figs_dir, exist_ok=True)
-
     # --- Mode: save_preprocessed ---
     if args.mode == "save_preprocessed":
         print("Indlæser data parallelt...")
@@ -1076,12 +963,20 @@ def main():
             start_year=args.start_year, end_year=args.end_year
         )
         print(f"Rå rækker: {len(df):,}")
+        # Første trin: filtrer på start/slut tid
+        df = df[df["Obstidfra"].notnull() & df["Obstidtil"].notnull()]
+        print(f"Rå rækker efter filter på tid: {len(df):,}")
+        # Generel processering
         print("Feature-engineering (DOF-format, decimalkomma, tider)...")
         df = engineer_features_parallel(df, workers=args.workers)
+        print("Filter art/år...")
+        df = filter_by_species_year(df, args.species_field, args.species, args.start_year, args.end_year)
         print("Projekterer til LAEA og tildeler 5x5 km grid...")
         df = project_to_laea(df, args.grid_crs)
         df = assign_grid_cells(df, args.grid_size_km)
+        # Gem preprocessed data
         print(f"Gemmer preprocessed data til: {args.preprocessed_path}")
+        os.makedirs(os.path.dirname(args.preprocessed_path), exist_ok=True)
         df.to_parquet(args.preprocessed_path)
         print("Preprocessed data gemt.")
         return
@@ -1099,6 +994,9 @@ def main():
             start_year=args.start_year, end_year=args.end_year
         )
         print(f"Rå rækker: {len(df):,}")
+        # Første trin: filtrer på start/slut tid
+        df = df[df["Obstidfra"].notnull() & df["Obstidtil"].notnull()]
+        print(f"Rå rækker efter filter på tid: {len(df):,}")
         print("Feature-engineering (DOF-format, decimalkomma, tider)...")
         df = engineer_features_parallel(df, workers=args.workers)
         print("Filter art/år...")
@@ -1116,6 +1014,31 @@ def main():
         "year_max": int(df["year"].max()),
         "n": f"{len(df):,}"
     }
+
+        # Udtræk artnavn og år-range
+    artnavn = (args.species or "art").replace(" ", "_")
+    year_min = int(df["year"].min())
+    year_max = int(df["year"].max())
+    year_range = f"{year_min}_{year_max}"
+
+    # Byg output-stier
+    base_output_dir = args.output
+    if base_output_dir.endswith(".csv") or base_output_dir.endswith(".txt"):
+        base_output_dir = os.path.dirname(base_output_dir)
+    if not base_output_dir:
+        base_output_dir = "output"
+
+    art_dir = os.path.join(base_output_dir, artnavn)
+    year_dir = os.path.join(art_dir, year_range)
+    figs_dir = os.path.join(year_dir, "figs")
+    os.makedirs(figs_dir, exist_ok=True)
+
+    # Filnavne
+    prefix = f"{artnavn}_{year_range}"
+    csv_path = os.path.join(year_dir, f"{prefix}.csv")
+    index_csv_path = os.path.join(year_dir, f"{prefix}_index.csv")
+    pdf_path = os.path.join(year_dir, f"{prefix}_rapport.pdf")
+
 
     print("Estimerer DML trend (global + evt. heterogen)...")
     res = estimate_trend_components_crossfit(df, heterogeneous=args.heterogeneous, ensemble_B=20, hetero_method=args.hetero_method) if crossfit else estimate_trend_components(df, heterogeneous=args.heterogeneous, ensemble_B=100)
@@ -1149,17 +1072,6 @@ def main():
         idx_lo = 100.0 * np.exp(tau_lo * (years - y0))
         idx_hi = 100.0 * np.exp(tau_hi * (years - y0))
 
-    # Gem indeks CSV
-    index_csv_path = os.path.splitext(args.output)[0] + "_index.csv"
-    idx_df = pd.DataFrame({
-        "year": years,
-        "index": idx_c,
-        "index_lo80": idx_lo,
-        "index_hi80": idx_hi
-    })
-    idx_df.to_csv(index_csv_path, index=False)
-    print(f"Populationsindeks CSV gemt: {index_csv_path}")
-
     # Gem indeks PNG (graf)
     index_png_path = os.path.join(figs_dir, "index.png")
     os.makedirs(os.path.dirname(index_png_path), exist_ok=True)  # <-- tilføj denne linje
@@ -1172,6 +1084,34 @@ def main():
     plt.grid(True, alpha=0.3); plt.legend()
     plt.tight_layout(); plt.savefig(index_png_path, dpi=180); plt.close()
     print(f"Populationsindeks PNG gemt: {index_png_path}")
+
+    # Modeloutput pr. år
+    year_idx_df = pd.DataFrame({
+        "year": years,
+        "model_index": idx_c,
+        "model_index_lo80": idx_lo,
+        "model_index_hi80": idx_hi
+    })
+    year_idx_csv = os.path.join(year_dir, f"{prefix}_yearwise_index.csv")
+    year_idx_df.to_csv(year_idx_csv, index=False)
+    print(f"Populationsindeks CSV gemt: {index_csv_path}")
+
+    # Rå sum pr. år
+    raw_year_df = df.groupby("year")["Antal"].sum().reset_index()
+    raw_year_csv = os.path.join(year_dir, f"{prefix}_raw_sum_per_year.csv")
+    raw_year_df.to_csv(raw_year_csv, index=False)
+
+    # Rå observationer (alle rækker)
+    raw_obs_csv = os.path.join(year_dir, f"{prefix}_raw_observations.csv")
+    df.to_csv(raw_obs_csv, index=False)
+
+    # Rå sum pr. grid
+    if "grid_id" in df.columns:
+        raw_grid_df = df.groupby("grid_id")["Antal"].sum().reset_index()
+        raw_grid_csv = os.path.join(year_dir, f"{prefix}_raw_sum_per_grid.csv")
+        raw_grid_df.to_csv(raw_grid_csv, index=False)
+
+    print("Gemte modeloutput og rå data pr. år, pr. grid og alle observationer.")
 
     out = {
         **meta,
@@ -1186,8 +1126,8 @@ def main():
         "PPY_detection_global": res["PPY_detection_global"],
         "PPY_count_global": res["PPY_count_global"],
     }
-    pd.DataFrame([out]).to_csv(args.output, index=False)
-    print(f"Resultater gemt: {args.output}")
+    pd.DataFrame([out]).to_csv(csv_path, index=False)
+    print(f"Resultater gemt: {csv_path}")
         
     # Figurer
     fig_paths = {}
@@ -1202,67 +1142,13 @@ def main():
     plot_components_bar(res["PPY_detection_global"], res["PPY_count_global"], fig_paths["comp"])
     plot_tau_calibration(sim_df, fig_paths["rc"])
 
+
     # Kort kun hvis heterogenitet er estimeret og tabellen findes
     if args.heterogeneous and ("tau_grid_table" in res):
         fig_paths["map"] = os.path.join(figs_dir, "map.png")
         plot_trend_map(res["tau_grid_table"], fig_paths["map"])
 
-    # --- ÅR-TIL-ÅR: DML årseffekter + RC-justering ---
-    yearwise_df, y0 = estimate_yearwise_components(df, lambda_diff=5.0)
-
-    # RC på offsets (valgfrit at gemme/plotte til QA)
-    yearwise_df = yearwise_df.sort_values("year").reset_index(drop=True)
-    yearwise_df["beta_abund_rc"] = beta0 + beta1 * yearwise_df["beta_abund"]
-    yearwise_df["index_rc"]      = 100.0 * np.exp(yearwise_df["beta_abund_rc"])
-
-    # RC på slopes (anbefalet): baseline = 0 i første år
-    tau_year    = yearwise_df["beta_abund"].diff().fillna(0.0)   # Δβ_y
-    tau_year_rc = beta0 + beta1 * tau_year
-    tau_year_rc.iloc[0] = 0.0                                    # baseline = 0
-    beta_rc = tau_year_rc.cumsum()
-    yearwise_df["beta_abund_rc_slope"] = beta_rc
-    yearwise_df["index_rc_slope"]      = 100.0 * np.exp(beta_rc)
-
-    # Stratificeret bootstrap pr. år -> 80% CI på slope-RC-kurven
-    print("Bootstrap (år-stratificeret) for 80% CI...")
-    years_ci, lo80, hi80 = bootstrap_yearwise(df, beta0=beta0, beta1=beta1, B=20, lambda_diff=5.0, random_state=123)
-
-    # Gem CSV (inkl. CI-bånd for slope-RC)
-    yearwise_df["index_rc_slope_lo80"] = lo80
-    yearwise_df["index_rc_slope_hi80"] = hi80
-    year_idx_csv = os.path.splitext(args.output)[0] + "_yearwise_index.csv"
-    yearwise_df.to_csv(year_idx_csv, index=False)
-    print(f"År-til-år indeks CSV gemt: {year_idx_csv}")
-
-    # Plot år-indeks (PRIMÆRT: slope-RC + 80% CI)
-    year_idx_slope_png = os.path.join(figs_dir, "index_yearwise_slope.png")
-    plt.figure(figsize=(7,4))
-    plt.plot(yearwise_df["year"], yearwise_df["index_rc_slope"],
-            color="#0C7BDC", lw=2, label="Årsindeks (RC på slopes)")
-    plt.scatter(yearwise_df["year"], yearwise_df["index_rc_slope"],
-                color="#0C7BDC", s=16)
-    plt.fill_between(yearwise_df["year"], yearwise_df["index_rc_slope_lo80"],
-                    yearwise_df["index_rc_slope_hi80"], color="#0C7BDC", alpha=0.20,
-                    label="80% CI (bootstrap)")
-    
-    # (valgfrit) vis også offset-RC som stiplet kurve
-    plt.plot(yearwise_df["year"], yearwise_df["index_rc"],
-            color="#7CB342", lw=1.5, ls="--", alpha=0.8,
-            label="Årsindeks (RC på offsets)")
-    plt.axhline(100, color="k", lw=0.8, alpha=0.4)
-    plt.xlabel("År"); plt.ylabel("Indeks (baseline=100)")
-    plt.title("År-til-år populationsindeks (DML, RC-justeret)")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    plt.savefig(year_idx_slope_png, dpi=180); plt.close()
-    print(f"År-til-år indeks (slope-RC) PNG gemt: {year_idx_slope_png}")
-
-    # Peg PDF'en til den nye år-til-år figur (slope-RC)
-    fig_paths["index"] = year_idx_slope_png
-
-    # PDF-rapport i output_dir
-    pdf_path = args.report_pdf
-    if not os.path.isabs(pdf_path):
-        pdf_path = os.path.join(output_dir, os.path.basename(args.report_pdf))
+    # PDF-rapport i pdf_path
     print("Genererer PDF-rapport...")
     make_pdf_report(pdf_path, meta, res, sim_df, fig_paths)
     print(f"Rapport gemt: {pdf_path}")
